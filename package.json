@@ -1,0 +1,19 @@
+{
+  "name": "b2-pages",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler pages dev public --binding B2_BUCKET_NAME=your-bucket B2_ENDPOINT=s3.us-west-004.backblazeb2.com",
+    "deploy": "wrangler pages deploy public",
+    "types": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241218.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^3.99.0"
+  },
+  "dependencies": {
+    "aws4": "^1.13.2"
+  }
+}
