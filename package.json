@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "wrangler pages dev public --binding B2_BUCKET_NAME=your-bucket B2_ENDPOINT=s3.us-west-004.backblazeb2.com",
     "deploy": "wrangler pages deploy public",
+    "build": "echo 'No build step required'",
     "types": "wrangler types"
   },
   "devDependencies": {
