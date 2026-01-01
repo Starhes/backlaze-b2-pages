@@ -68,6 +68,7 @@ interface AuthData {
     dateStamp: string;
     region: string;
     service: string;
+    fullDate?: string; // For Query Auth
 }
 
 function parseAuthHeader(auth: string): AuthData | null {
@@ -78,7 +79,6 @@ function parseAuthHeader(auth: string): AuthData | null {
         const algorithm = auth.slice(0, spaceIndex);
         const params = auth.slice(spaceIndex + 1);
 
-        // Handle 'Credential=..., SignedHeaders=..., Signature=...'
         const parts: Record<string, string> = {};
         params.split(',').forEach(part => {
             const [key, value] = part.trim().split('=');
@@ -102,49 +102,92 @@ function parseAuthHeader(auth: string): AuthData | null {
     }
 }
 
+function parseAuthQuery(url: URL): AuthData | null {
+    const params = url.searchParams;
+    if (!params.has('X-Amz-Signature')) return null;
+
+    const algorithm = params.get('X-Amz-Algorithm');
+    const credential = params.get('X-Amz-Credential');
+    const dateStampRaw = params.get('X-Amz-Date');
+    const signedHeadersStr = params.get('X-Amz-SignedHeaders');
+    const signature = params.get('X-Amz-Signature');
+
+    if (!algorithm || !credential || !dateStampRaw || !signedHeadersStr || !signature) return null;
+
+    const credentialParts = credential.split('/');
+
+    return {
+        algorithm,
+        credential,
+        signedHeaders: signedHeadersStr.split(';'),
+        signature,
+        accessKeyId: credentialParts[0],
+        dateStamp: credentialParts[1],
+        region: credentialParts[2],
+        service: credentialParts[3],
+        fullDate: dateStampRaw
+    };
+}
+
 interface VerifyResult {
     isValid: boolean;
     debugInfo?: any;
 }
 
 async function verifyRequest(request: Request, env: Env): Promise<VerifyResult> {
+    const url = new URL(request.url);
     const authHeader = request.headers.get('Authorization');
-    if (!authHeader) return { isValid: false, debugInfo: 'No Authorization header' };
 
-    const authData = parseAuthHeader(authHeader);
-    if (!authData) return { isValid: false, debugInfo: 'Failed to parse Auth header' };
+    let authData: AuthData | null = null;
+    let isQueryAuth = false;
+
+    if (authHeader) {
+        authData = parseAuthHeader(authHeader);
+    } else if (url.searchParams.has('X-Amz-Signature')) {
+        authData = parseAuthQuery(url);
+        isQueryAuth = true;
+    }
+
+    if (!authData) return { isValid: false, debugInfo: 'No valid Auth found' };
 
     if (authData.accessKeyId !== env.B2_ACCESS_KEY_ID) {
         return { isValid: false, debugInfo: `AccessKey mismatch. Expected: ${env.B2_ACCESS_KEY_ID}, Got: ${authData.accessKeyId}` };
     }
 
-    const url = new URL(request.url);
-
     const canonicalHeadersList = authData.signedHeaders.map(key => {
-        // Headers must be trimmed and lowercased
         const value = request.headers.get(key) || '';
         return `${key}:${value.trim().replace(/\s+/g, ' ')}`;
     });
     const canonicalHeaders = canonicalHeadersList.join('\n') + '\n';
-
     const signedHeadersString = authData.signedHeaders.join(';');
 
-    const payloadHash = request.headers.get('x-amz-content-sha256') || 'UNSIGNED-PAYLOAD';
+    const payloadHash = isQueryAuth ? 'UNSIGNED-PAYLOAD' : (request.headers.get('x-amz-content-sha256') || 'UNSIGNED-PAYLOAD');
 
-    const canonicalQueryString = Array.from(url.searchParams.entries())
-        .sort(([a], [b]) => {
-            // Strict byte sort comparison
-            if (a < b) return -1;
-            if (a > b) return 1;
-            return 0;
-        })
-        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-        .join('&');
+    // For Query Auth, we must remove X-Amz-Signature from the params used in calculation
+    let canonicalQueryStringString = '';
 
-    // S3 Canonical URI requires strict encoding
-    // request.url path is usually decoded. We need to re-encode it cautiously.
-    // AWS Signature V4 requires all characters to be encoded except unreserved: A-Z a-z 0-9 - . _ ~
-    // And forward slashes '/' should not be encoded (if they are path separators).
+    if (isQueryAuth) {
+        const qParams = new URLSearchParams(url.searchParams);
+        qParams.delete('X-Amz-Signature');
+        canonicalQueryStringString = Array.from(qParams.entries())
+            .sort(([a], [b]) => {
+                if (a < b) return -1;
+                if (a > b) return 1;
+                return 0;
+            })
+            .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+            .join('&');
+    } else {
+        canonicalQueryStringString = Array.from(url.searchParams.entries())
+            .sort(([a], [b]) => {
+                // Strict byte sort comparison
+                if (a < b) return -1;
+                if (a > b) return 1;
+                return 0;
+            })
+            .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+            .join('&');
+    }
 
     const path = url.pathname;
     const canonicalUri = path.split('/').map(segment =>
@@ -154,13 +197,13 @@ async function verifyRequest(request: Request, env: Env): Promise<VerifyResult> 
     const canonicalRequest = [
         request.method.toUpperCase(),
         canonicalUri,
-        canonicalQueryString,
+        canonicalQueryStringString,
         canonicalHeaders,
         signedHeadersString,
         payloadHash
     ].join('\n');
 
-    const amzDate = request.headers.get('x-amz-date') || '';
+    const amzDate = isQueryAuth ? authData.fullDate : (request.headers.get('x-amz-date') || '');
     if (!amzDate) return { isValid: false, debugInfo: 'Missing x-amz-date' };
 
     const credentialScope = `${authData.dateStamp}/${authData.region}/${authData.service}/aws4_request`;
@@ -281,9 +324,23 @@ export const onRequest: PagesFunction<Env> = async (context) => {
     const method = request.method.toUpperCase();
 
     // 1. Verify Inbound Request
-    const hasAuth = request.headers.has('Authorization');
-    const isWrite = ['PUT', 'POST', 'DELETE'].includes(method);
+    const hasAuthHeader = request.headers.has('Authorization');
+    const hasQueryAuth = url.searchParams.has('X-Amz-Signature');
+    const hasAuth = hasAuthHeader || hasQueryAuth;
 
+    // Allow GET/HEAD without strict auth if public? 
+    // But Memos uses private buckets usually. 
+    // Existing logic: "isWrite && !hasAuth" -> 401. 
+    // This implies GET (read) is allowed without Auth?
+    // Wait, if Memos uses Presigned URL, it means the bucket is PRIVATE.
+    // So GET requests MUST have auth (Query or Header).
+    // The current logic only enforces Auth for Write.
+    // But if we want to proxy a private bucket, we must enforce it for GET too if the bucket is private.
+    // However, I should probably stick to the existing logic structure but enforce verification if Auth IS present.
+    // For Presigned URLs, Auth IS present.
+
+    // If it's a Write request, require Auth.
+    const isWrite = ['PUT', 'POST', 'DELETE'].includes(method);
     if (isWrite && !hasAuth) {
         return new Response(JSON.stringify({ error: 'Authentication required' }), {
             status: 401,
@@ -306,23 +363,22 @@ export const onRequest: PagesFunction<Env> = async (context) => {
     }
 
     // 2. Prepare Outbound Request
-    // 2. Prepare Outbound Request
     let path = url.pathname;
     // Fix: If path already starts with /bucketName, don't append it again
     if (path.startsWith(`/${env.B2_BUCKET_NAME}`)) {
-        // Path Style request from client: /bucket/key -> B2 expects /bucket/key?
-        // Wait, B2 S3 endpoint is https://s3.us-west-004.backblazeb2.com/bucketName/key
-        // If client sends /bucketName/key, we should use that directly.
-        // If client sends /key (Virtual Hosted style converted), we prepend.
-        // BUT, my logic below was forcing append.
+        // Path Style request from client
     } else {
         path = `/${env.B2_BUCKET_NAME}${path}`;
     }
 
     const b2Url = new URL(`https://${env.B2_ENDPOINT}${path}`);
 
+    // Filter out X-Amz-* parameters from Client to avoid double-auth on B2
+    const filteredParams = Array.from(url.searchParams.entries())
+        .filter(([key]) => !key.toLowerCase().startsWith('x-amz-'));
+
     // AWS Query sorting must be strict byte-order, not localeCompare
-    const sortedParams = Array.from(url.searchParams.entries())
+    const sortedParams = filteredParams
         .sort(([a], [b]) => {
             if (a < b) return -1;
             if (a > b) return 1;
