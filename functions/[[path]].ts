@@ -132,7 +132,12 @@ async function verifyRequest(request: Request, env: Env): Promise<VerifyResult> 
     const payloadHash = request.headers.get('x-amz-content-sha256') || 'UNSIGNED-PAYLOAD';
 
     const canonicalQueryString = Array.from(url.searchParams.entries())
-        .sort(([a], [b]) => a.localeCompare(b))
+        .sort(([a], [b]) => {
+            // Strict byte sort comparison
+            if (a < b) return -1;
+            if (a > b) return 1;
+            return 0;
+        })
         .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
         .join('&');
 
@@ -224,7 +229,12 @@ async function signRequest(
         .join('\n') + '\n';
 
     const canonicalQueryString = Array.from(url.searchParams.entries())
-        .sort(([a], [b]) => a.localeCompare(b))
+        .sort(([a], [b]) => {
+            // Strict byte sort comparison
+            if (a < b) return -1;
+            if (a > b) return 1;
+            return 0;
+        })
         .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
         .join('&');
 
@@ -296,8 +306,30 @@ export const onRequest: PagesFunction<Env> = async (context) => {
     }
 
     // 2. Prepare Outbound Request
-    const b2Url = new URL(`https://${env.B2_ENDPOINT}/${env.B2_BUCKET_NAME}${url.pathname}`);
-    url.searchParams.forEach((value, key) => {
+    // 2. Prepare Outbound Request
+    let path = url.pathname;
+    // Fix: If path already starts with /bucketName, don't append it again
+    if (path.startsWith(`/${env.B2_BUCKET_NAME}`)) {
+        // Path Style request from client: /bucket/key -> B2 expects /bucket/key?
+        // Wait, B2 S3 endpoint is https://s3.us-west-004.backblazeb2.com/bucketName/key
+        // If client sends /bucketName/key, we should use that directly.
+        // If client sends /key (Virtual Hosted style converted), we prepend.
+        // BUT, my logic below was forcing append.
+    } else {
+        path = `/${env.B2_BUCKET_NAME}${path}`;
+    }
+
+    const b2Url = new URL(`https://${env.B2_ENDPOINT}${path}`);
+
+    // AWS Query sorting must be strict byte-order, not localeCompare
+    const sortedParams = Array.from(url.searchParams.entries())
+        .sort(([a], [b]) => {
+            if (a < b) return -1;
+            if (a > b) return 1;
+            return 0;
+        });
+
+    sortedParams.forEach(([key, value]) => {
         b2Url.searchParams.set(key, value);
     });
 
