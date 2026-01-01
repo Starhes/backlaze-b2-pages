@@ -314,129 +314,148 @@ export const onRequest: PagesFunction<Env> = async (context) => {
     const { request, env } = context;
     const url = new URL(request.url);
 
-    if (!env.B2_BUCKET_NAME || !env.B2_ENDPOINT || !env.B2_ACCESS_KEY_ID || !env.B2_SECRET_ACCESS_KEY) {
-        return new Response(JSON.stringify({ error: 'Missing configuration' }), {
+    try {
+        console.log(`[B2-Proxy] Incoming Request: ${request.method} ${url.pathname}${url.search}`);
+
+        const configError: string[] = [];
+        if (!env.B2_BUCKET_NAME) configError.push('B2_BUCKET_NAME');
+        if (!env.B2_ENDPOINT) configError.push('B2_ENDPOINT');
+        if (!env.B2_ACCESS_KEY_ID) configError.push('B2_ACCESS_KEY_ID');
+        if (!env.B2_SECRET_ACCESS_KEY) configError.push('B2_SECRET_ACCESS_KEY');
+
+        if (configError.length > 0) {
+            console.error(`[B2-Proxy] Missing Configuration: ${configError.join(', ')}`);
+            return new Response(JSON.stringify({ error: 'Missing configuration', missing: configError }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        const method = request.method.toUpperCase();
+
+        // 1. Verify Inbound Request
+        const hasAuthHeader = request.headers.has('Authorization');
+        const hasQueryAuth = url.searchParams.has('X-Amz-Signature');
+        const hasAuth = hasAuthHeader || hasQueryAuth;
+
+        console.log(`[B2-Proxy] Auth Status - Header: ${hasAuthHeader}, Query: ${hasQueryAuth}`);
+
+        // If it's a Write request, require Auth.
+        const isWrite = ['PUT', 'POST', 'DELETE'].includes(method);
+        if (isWrite && !hasAuth) {
+            console.warn('[B2-Proxy] Rejecting write request without auth');
+            return new Response(JSON.stringify({ error: 'Authentication required' }), {
+                status: 401,
+                headers: { 'Content-Type': 'application/json', 'WWW-Authenticate': 'AWS4-HMAC-SHA256' }
+            });
+        }
+
+        if (hasAuth) {
+            const { isValid, debugInfo } = await verifyRequest(request, env);
+            if (!isValid) {
+                console.error('[B2-Proxy] Signature Verification Failed', JSON.stringify(debugInfo));
+                return new Response(JSON.stringify({
+                    error: 'SignatureDoesNotMatch',
+                    detail: 'The request signature we calculated does not match the signature you provided. Check your key and signing method.',
+                    debug: debugInfo
+                }, null, 2), {
+                    status: 403,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+            console.log('[B2-Proxy] Signature Verification Passed');
+        }
+
+        // 2. Prepare Outbound Request
+        let path = url.pathname;
+        // Fix: If path already starts with /bucketName, don't append it again
+        if (path.startsWith(`/${env.B2_BUCKET_NAME}`)) {
+            // Path Style request from client
+        } else {
+            path = `/${env.B2_BUCKET_NAME}${path}`;
+        }
+
+        console.log(`[B2-Proxy] Upstream Path: ${path}`);
+
+        const b2Url = new URL(`https://${env.B2_ENDPOINT}${path}`);
+
+        // Filter out X-Amz-* parameters from Client to avoid double-auth on B2
+        const filteredParams = Array.from(url.searchParams.entries())
+            .filter(([key]) => !key.toLowerCase().startsWith('x-amz-'));
+
+        // AWS Query sorting must be strict byte-order, not localeCompare
+        const sortedParams = filteredParams
+            .sort(([a], [b]) => {
+                if (a < b) return -1;
+                if (a > b) return 1;
+                return 0;
+            });
+
+        sortedParams.forEach(([key, value]) => {
+            b2Url.searchParams.set(key, value);
+        });
+
+        // 3. Sign Outbound Request
+        let contentHash = 'UNSIGNED-PAYLOAD';
+        if (method === 'GET' || method === 'HEAD') {
+            contentHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+        } else if (request.headers.has('x-amz-content-sha256')) {
+            contentHash = request.headers.get('x-amz-content-sha256') || 'UNSIGNED-PAYLOAD';
+        }
+
+        // 3a. Prepare Headers for signing
+        const upstreamHeaders = new Headers();
+        const allowedHeaders = ['content-type', 'content-length', 'content-disposition', 'cache-control', 'range', 'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since'];
+        for (const [key, value] of request.headers) {
+            if (allowedHeaders.includes(key.toLowerCase()) || key.toLowerCase().startsWith('x-amz-')) {
+                upstreamHeaders.set(key.toLowerCase(), value); // Normalize to lowercase
+            }
+        }
+
+        await signRequest(
+            method,
+            b2Url,
+            upstreamHeaders,
+            contentHash,
+            env.B2_ACCESS_KEY_ID,
+            env.B2_SECRET_ACCESS_KEY
+        );
+
+        // 4. Fetch
+        const fetchOptions: RequestInit & { cf?: any } = {
+            method,
+            headers: upstreamHeaders,
+            body: (method === 'GET' || method === 'HEAD') ? null : request.body,
+        };
+
+        if (method === 'GET' || method === 'HEAD') {
+            fetchOptions.cf = {
+                cacheEverything: true
+            };
+        }
+
+        console.log(`[B2-Proxy] Fetching B2: ${b2Url.toString()}`);
+
+        const b2Response = await fetch(b2Url.toString(), fetchOptions);
+
+        console.log(`[B2-Proxy] B2 Response: ${b2Response.status} ${b2Response.statusText}`);
+
+        const responseHeaders = new Headers(b2Response.headers);
+        responseHeaders.set('X-Proxy', 'b2-pages-verified');
+        responseHeaders.delete('x-amz-request-id');
+        responseHeaders.delete('x-amz-id-2');
+
+        return new Response(b2Response.body, {
+            status: b2Response.status,
+            statusText: b2Response.statusText,
+            headers: responseHeaders
+        });
+
+    } catch (err: any) {
+        console.error('[B2-Proxy] Internal Error:', err.stack || err);
+        return new Response(JSON.stringify({ error: 'Internal Server Error', detail: err.message }), {
             status: 500,
             headers: { 'Content-Type': 'application/json' }
         });
     }
-
-    const method = request.method.toUpperCase();
-
-    // 1. Verify Inbound Request
-    const hasAuthHeader = request.headers.has('Authorization');
-    const hasQueryAuth = url.searchParams.has('X-Amz-Signature');
-    const hasAuth = hasAuthHeader || hasQueryAuth;
-
-    // Allow GET/HEAD without strict auth if public? 
-    // But Memos uses private buckets usually. 
-    // Existing logic: "isWrite && !hasAuth" -> 401. 
-    // This implies GET (read) is allowed without Auth?
-    // Wait, if Memos uses Presigned URL, it means the bucket is PRIVATE.
-    // So GET requests MUST have auth (Query or Header).
-    // The current logic only enforces Auth for Write.
-    // But if we want to proxy a private bucket, we must enforce it for GET too if the bucket is private.
-    // However, I should probably stick to the existing logic structure but enforce verification if Auth IS present.
-    // For Presigned URLs, Auth IS present.
-
-    // If it's a Write request, require Auth.
-    const isWrite = ['PUT', 'POST', 'DELETE'].includes(method);
-    if (isWrite && !hasAuth) {
-        return new Response(JSON.stringify({ error: 'Authentication required' }), {
-            status: 401,
-            headers: { 'Content-Type': 'application/json', 'WWW-Authenticate': 'AWS4-HMAC-SHA256' }
-        });
-    }
-
-    if (hasAuth) {
-        const { isValid, debugInfo } = await verifyRequest(request, env);
-        if (!isValid) {
-            return new Response(JSON.stringify({
-                error: 'SignatureDoesNotMatch',
-                detail: 'The request signature we calculated does not match the signature you provided. Check your key and signing method.',
-                debug: debugInfo
-            }, null, 2), {
-                status: 403,
-                headers: { 'Content-Type': 'application/json' }
-            });
-        }
-    }
-
-    // 2. Prepare Outbound Request
-    let path = url.pathname;
-    // Fix: If path already starts with /bucketName, don't append it again
-    if (path.startsWith(`/${env.B2_BUCKET_NAME}`)) {
-        // Path Style request from client
-    } else {
-        path = `/${env.B2_BUCKET_NAME}${path}`;
-    }
-
-    const b2Url = new URL(`https://${env.B2_ENDPOINT}${path}`);
-
-    // Filter out X-Amz-* parameters from Client to avoid double-auth on B2
-    const filteredParams = Array.from(url.searchParams.entries())
-        .filter(([key]) => !key.toLowerCase().startsWith('x-amz-'));
-
-    // AWS Query sorting must be strict byte-order, not localeCompare
-    const sortedParams = filteredParams
-        .sort(([a], [b]) => {
-            if (a < b) return -1;
-            if (a > b) return 1;
-            return 0;
-        });
-
-    sortedParams.forEach(([key, value]) => {
-        b2Url.searchParams.set(key, value);
-    });
-
-    const headers = new Headers();
-    const allowedHeaders = ['content-type', 'content-length', 'content-disposition', 'cache-control', 'range', 'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since'];
-    for (const [key, value] of request.headers) {
-        if (allowedHeaders.includes(key.toLowerCase()) || key.toLowerCase().startsWith('x-amz-')) {
-            headers.set(key, value);
-        }
-    }
-
-    // 3. Sign Outbound Request
-    let contentHash = 'UNSIGNED-PAYLOAD';
-    if (method === 'GET' || method === 'HEAD') {
-        contentHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
-    } else if (request.headers.has('x-amz-content-sha256')) {
-        contentHash = 'UNSIGNED-PAYLOAD';
-    }
-
-    await signRequest(
-        method,
-        b2Url,
-        headers,
-        contentHash,
-        env.B2_ACCESS_KEY_ID,
-        env.B2_SECRET_ACCESS_KEY
-    );
-
-    // 4. Fetch
-    const fetchOptions: RequestInit & { cf?: any } = {
-        method,
-        headers,
-        body: (method === 'GET' || method === 'HEAD') ? null : request.body,
-    };
-
-    if (method === 'GET' || method === 'HEAD') {
-        fetchOptions.cf = {
-            cacheEverything: true
-        };
-    }
-
-    const b2Response = await fetch(b2Url.toString(), fetchOptions);
-
-    const responseHeaders = new Headers(b2Response.headers);
-    responseHeaders.set('X-Proxy', 'b2-pages-verified');
-    responseHeaders.delete('x-amz-request-id');
-    responseHeaders.delete('x-amz-id-2');
-
-    return new Response(b2Response.body, {
-        status: b2Response.status,
-        statusText: b2Response.statusText,
-        headers: responseHeaders
-    });
 };
