@@ -333,12 +333,19 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         const upstreamHeaders = new Headers();
         // Extended list of allowed headers for various S3 operations
         const allowedHeaders = [
-            'content-type', 'content-length', 'content-disposition', 'content-encoding',
+            // Standard content headers
+            'content-type', 'content-length', 'content-disposition', 'content-encoding', 'content-md5',
             'cache-control', 'range', 'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since',
+            // Copy operation headers
             'x-amz-copy-source', 'x-amz-copy-source-if-match', 'x-amz-copy-source-if-none-match',
             'x-amz-copy-source-if-modified-since', 'x-amz-copy-source-if-unmodified-since',
             'x-amz-metadata-directive', 'x-amz-tagging-directive', 'x-amz-storage-class',
-            'x-amz-acl', 'x-amz-grant-read', 'x-amz-grant-write', 'x-amz-grant-read-acp', 'x-amz-grant-write-acp', 'x-amz-grant-full-control'
+            // ACL headers
+            'x-amz-acl', 'x-amz-grant-read', 'x-amz-grant-write', 'x-amz-grant-read-acp', 'x-amz-grant-write-acp', 'x-amz-grant-full-control',
+            // Multipart/Chunked upload headers
+            'x-amz-decoded-content-length', 'x-amz-trailer',
+            // Checksum headers
+            'x-amz-sdk-checksum-algorithm', 'x-amz-checksum-crc32', 'x-amz-checksum-crc32c', 'x-amz-checksum-sha1', 'x-amz-checksum-sha256'
         ];
         for (const [key, value] of request.headers) {
             const lowerKey = key.toLowerCase();
