@@ -303,9 +303,11 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 
         const b2Url = new URL(`https://${env.B2_ENDPOINT}${path}`);
 
-        // Filter out X-Amz-* parameters from Client to avoid double-auth on B2
+        // Filter out X-Amz-* authentication parameters from Client to avoid double-auth on B2
+        // Keep S3 operation-specific params like list-type, prefix, etc.
+        const authParams = ['x-amz-algorithm', 'x-amz-credential', 'x-amz-date', 'x-amz-expires', 'x-amz-signedheaders', 'x-amz-signature', 'x-amz-security-token'];
         const filteredParams = Array.from(url.searchParams.entries())
-            .filter(([key]) => !key.toLowerCase().startsWith('x-amz-'));
+            .filter(([key]) => !authParams.includes(key.toLowerCase()));
 
         // AWS Query sorting must be strict byte-order, not localeCompare
         const sortedParams = filteredParams
@@ -329,10 +331,19 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 
         // 3a. Prepare Headers for signing
         const upstreamHeaders = new Headers();
-        const allowedHeaders = ['content-type', 'content-length', 'content-disposition', 'cache-control', 'range', 'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since'];
+        // Extended list of allowed headers for various S3 operations
+        const allowedHeaders = [
+            'content-type', 'content-length', 'content-disposition', 'content-encoding',
+            'cache-control', 'range', 'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since',
+            'x-amz-copy-source', 'x-amz-copy-source-if-match', 'x-amz-copy-source-if-none-match',
+            'x-amz-copy-source-if-modified-since', 'x-amz-copy-source-if-unmodified-since',
+            'x-amz-metadata-directive', 'x-amz-tagging-directive', 'x-amz-storage-class',
+            'x-amz-acl', 'x-amz-grant-read', 'x-amz-grant-write', 'x-amz-grant-read-acp', 'x-amz-grant-write-acp', 'x-amz-grant-full-control'
+        ];
         for (const [key, value] of request.headers) {
-            if (allowedHeaders.includes(key.toLowerCase()) || key.toLowerCase().startsWith('x-amz-')) {
-                upstreamHeaders.set(key.toLowerCase(), value); // Normalize to lowercase
+            const lowerKey = key.toLowerCase();
+            if (allowedHeaders.includes(lowerKey)) {
+                upstreamHeaders.set(lowerKey, value);
             }
         }
 
@@ -346,11 +357,17 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         );
 
         // 4. Fetch
-        const fetchOptions: RequestInit & { cf?: any } = {
+        const hasBody = method !== 'GET' && method !== 'HEAD' && method !== 'DELETE';
+        const fetchOptions: RequestInit & { cf?: any, duplex?: string } = {
             method,
             headers: upstreamHeaders,
-            body: (method === 'GET' || method === 'HEAD') ? null : request.body,
+            body: hasBody ? request.body : null,
         };
+
+        // Use duplex for streaming body
+        if (hasBody) {
+            fetchOptions.duplex = 'half';
+        }
 
         if (method === 'GET' || method === 'HEAD') {
             fetchOptions.cf = {
