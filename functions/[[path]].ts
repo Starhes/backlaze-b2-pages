@@ -294,29 +294,15 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         let path = url.pathname;
 
         // Path handling: 
-        // - Client may send path-style requests like /bucket/key or virtual-hosted style /key
-        // - We need to ensure the final path is /{B2_BUCKET_NAME}/{key}
-        // - Strip any leading segment that looks like a bucket name from client (e.g., /memo/key -> /key)
+        // - Client sends path-style /bucket/key (e.g., /memo/assets/file.png)
+        // - We prepend B2 actual bucket name: /vseuhdadvfdg/memo/assets/file.png
+        // - This way client's "bucket" becomes a directory in B2
 
-        // Split path into segments and check if first segment is a bucket-like prefix
-        const segments = path.split('/').filter(s => s.length > 0);
-
-        if (segments.length > 0) {
-            const firstSegment = segments[0];
-            // If first segment equals B2_BUCKET_NAME, it's already correct
-            if (firstSegment === env.B2_BUCKET_NAME) {
-                // Path is already correct, keep it
-            } else {
-                // Assume first segment might be a client-configured bucket name
-                // Check if it looks like a bucket name (not a file/directory structure)
-                // For S3 path-style, the first segment after / is typically the bucket
-                // We'll strip it and use our own bucket name
-                const keyPath = '/' + segments.slice(1).join('/');
-                path = `/${env.B2_BUCKET_NAME}${keyPath}`;
-            }
+        if (path.startsWith(`/${env.B2_BUCKET_NAME}`)) {
+            // Path already starts with B2 bucket name, keep it
         } else {
-            // Root path - just use bucket root
-            path = `/${env.B2_BUCKET_NAME}`;
+            // Prepend B2 bucket name
+            path = `/${env.B2_BUCKET_NAME}${path}`;
         }
 
         console.log(`[B2-Proxy] Upstream Path: ${path}`);
