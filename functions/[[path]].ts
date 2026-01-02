@@ -295,14 +295,22 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 
         // Path handling: 
         // - Client sends path-style /bucket/key (e.g., /memo/assets/file.png)
-        // - We prepend B2 actual bucket name: /vseuhdadvfdg/memo/assets/file.png
-        // - This way client's "bucket" becomes a directory in B2
+        // - We strip the first segment (client's bucket name) and replace with B2 bucket
+        // - Result: /vseuhdadvfdg/assets/file.png
 
-        if (path.startsWith(`/${env.B2_BUCKET_NAME}`)) {
-            // Path already starts with B2 bucket name, keep it
+        const segments = path.split('/').filter(s => s.length > 0);
+
+        if (segments.length > 0) {
+            const firstSegment = segments[0];
+            if (firstSegment === env.B2_BUCKET_NAME) {
+                // Already correct, keep it
+            } else {
+                // Strip first segment (client bucket) and replace with B2 bucket
+                const keyPath = '/' + segments.slice(1).join('/');
+                path = `/${env.B2_BUCKET_NAME}${keyPath}`;
+            }
         } else {
-            // Prepend B2 bucket name
-            path = `/${env.B2_BUCKET_NAME}${path}`;
+            path = `/${env.B2_BUCKET_NAME}`;
         }
 
         console.log(`[B2-Proxy] Upstream Path: ${path}`);
