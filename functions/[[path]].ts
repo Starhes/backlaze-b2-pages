@@ -265,9 +265,9 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         console.log(`[B2-Proxy] Auth Status - Header: ${hasAuthHeader}, Query: ${hasQueryAuth}`);
 
         // If it's a Write request, require Auth.
-        const isWrite = ['PUT', 'POST', 'DELETE'].includes(method);
-        if (isWrite && !hasAuth) {
-            console.warn('[B2-Proxy] Rejecting write request without auth');
+        // SECURITY: Require auth for ALL requests (including GET) to protect private content
+        if (!hasAuth) {
+            console.warn('[B2-Proxy] Rejecting request without auth');
             return new Response(JSON.stringify({ error: 'Authentication required' }), {
                 status: 401,
                 headers: { 'Content-Type': 'application/json', 'WWW-Authenticate': 'AWS4-HMAC-SHA256' }
@@ -295,22 +295,14 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 
         // Path handling: 
         // - Client sends path-style /bucket/key (e.g., /memo/assets/file.png)
-        // - We strip the first segment (client's bucket name) and replace with B2 bucket
-        // - Result: /vseuhdadvfdg/assets/file.png
+        // - We prepend B2 actual bucket name: /vseuhdadvfdg/memo/assets/file.png
+        // - Client's "bucket" becomes a directory in B2
 
-        const segments = path.split('/').filter(s => s.length > 0);
-
-        if (segments.length > 0) {
-            const firstSegment = segments[0];
-            if (firstSegment === env.B2_BUCKET_NAME) {
-                // Already correct, keep it
-            } else {
-                // Strip first segment (client bucket) and replace with B2 bucket
-                const keyPath = '/' + segments.slice(1).join('/');
-                path = `/${env.B2_BUCKET_NAME}${keyPath}`;
-            }
+        if (path.startsWith(`/${env.B2_BUCKET_NAME}`)) {
+            // Path already starts with B2 bucket name, keep it
         } else {
-            path = `/${env.B2_BUCKET_NAME}`;
+            // Prepend B2 bucket name (keeps client bucket as directory)
+            path = `/${env.B2_BUCKET_NAME}${path}`;
         }
 
         console.log(`[B2-Proxy] Upstream Path: ${path}`);
